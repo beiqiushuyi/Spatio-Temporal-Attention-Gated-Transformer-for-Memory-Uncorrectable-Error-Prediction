@@ -1,1 +1,2490 @@
+# -*- coding: utf-8 -*-
+
+import torch  
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import math
+import abc
+import os
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
+from datetime import datetime
+from multiprocessing import Pool
+from typing import Dict, Tuple, NoReturn, Union, List
+from tqdm import tqdm 
+import feather
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import warnings
+warnings.filterwarnings('ignore')
+import torch
+import subprocess
+import re
+import gc
+
+def get_real_gpu_memory():
+    """通过nvidia-smi获取真实的GPU内存使用情况"""
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.total,memory.used,memory.free', 
+                               '--format=csv,noheader,nounits'], 
+                               capture_output=True, text=True, check=True)
+        
+        gpu_info = []
+        for line in result.stdout.strip().split('\n'):
+            if line.strip():
+                parts = [x.strip() for x in line.split(',')]
+                gpu_id = int(parts[0])
+                gpu_name = parts[1]
+                total_mb = float(parts[2])
+                used_mb = float(parts[3]) 
+                free_mb = float(parts[4])
+                
+                total_gb = total_mb / 1024
+                used_gb = used_mb / 1024
+                free_gb = free_mb / 1024
+                
+                gpu_info.append((gpu_id, gpu_name, total_gb, used_gb, free_gb))
+        
+        return gpu_info
+    
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(" 无法执行nvidia-smi，回退到torch检测")
+        return None
+
+def auto_select_best_gpu_fixed():
+    """GPU选择器"""
+    if not torch.cuda.is_available():
+        print(" CUDA不可用，使用CPU")
+        return "cpu"
+    
+    gpu_info = get_real_gpu_memory()
+    
+    if gpu_info:
+        print(f" 检测到 {len(gpu_info)} 块GPU (nvidia-smi)")
+        print("\n 真实GPU显存状态:")
+        
+        best_gpu = 0
+        max_free_memory = 0
+        
+        for gpu_id, gpu_name, total_gb, used_gb, free_gb in gpu_info:
+            usage_percent = (used_gb / total_gb) * 100
+            
+            print(f"  GPU {gpu_id}: {gpu_name}")
+            print(f"    总显存: {total_gb:.1f} GB")
+            print(f"    已使用: {used_gb:.1f} GB ({usage_percent:.1f}%)")
+            print(f"    可用: {free_gb:.1f} GB")
+            
+            if free_gb > max_free_memory:
+                max_free_memory = free_gb
+                best_gpu = gpu_id
+            print()
+        
+        torch.cuda.set_device(best_gpu)
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        device_name = f"cuda:{best_gpu}"
+        print(f" 自动选择: GPU {best_gpu}")
+        print(f" 设备: {device_name}")
+        print(f" 可用显存: {max_free_memory:.1f} GB")
+
+# 时间常量
+ONE_MINUTE = 60
+ONE_HOUR = 3600
+ONE_DAY = 86400
+
+@dataclass
+class STIMConfig(object):
+    """训练的STIM配置类"""
+    
+    DATA_SUFFIX: str = field(default="feather", init=False)
+    IMPUTE_VALUE: int = field(default=-1, init=False)
+    USE_MULTI_PROCESS: bool = field(default=True, init=False)
+    WORKER_NUM: int = field(default=16, init=False)
+    
+    # 数据路径配置
+    feature_path: str = "To be filled"
+    train_data_path: str = "To be filled" 
+    test_data_path: str = "To be filled"
+    ticket_path: str = "To be filled"
+    
+    # 日期范围配置
+    train_date_range: tuple = ("2023-12-29", "2024-03-31")  
+    test_data_range: tuple = ("2024-04-01", "2024-05-31")   
+    
+    # STIM特征参数
+    observation_hours: int = field(default=72, init=False)
+    num_features: int = field(default=44, init=False)
+    
+    # Transformer模型参数 - 
+    d_model: int = field(default=256, init=False)
+    num_heads: int = field(default=4, init=False)
+    num_layers: int = field(default=2, init=False)
+    num_spatial_layers: int = field(default=2, init=True)
+    dropout: float = field(default=0.3, init=False)
+    
+    # 训练参数
+    batch_size: int = field(default=32, init=False)
+    learning_rate: float = field(default=1e-6)
+    num_epochs: int = field(default=80, init=False)
+    device: str = field(default="cuda" if torch.cuda.is_available() else "cpu", init=False)
+    
+    # 早停参数
+    early_stopping_patience: int = field(default=15, init=True)
+    early_stopping_min_delta: float = field(default=0.001, init=True)
+    
+    # 不平衡数据处理参数
+    use_focal_loss: bool = field(default=True)
+    focal_alpha: float = field(default=0.6)
+    focal_gamma: float = field(default=1.5)
+    # α参数
+    use_dynamic_alpha: bool = field(default=True)
+    min_alpha: float = field(default=0.25)
+    max_alpha: float = field(default=0.75)
+    # 采样策略
+    use_weighted_sampling: bool = field(default=True)
+    positive_sample_weight: float = field(default=8.0)
+
+class EarlyStopping:
+    """早停机制类"""
+    
+    def __init__(self, patience=15, min_delta=0.001, mode='max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.best_score = None
+        self.epochs_no_improve = 0
+        self.should_stop = False
+        self.best_model_state = None
+        
+    def __call__(self, score, model):
+        if self.best_score is None:
+            self.best_score = score
+            self.best_model_state = model.state_dict().copy()
+            return False
+            
+        if self.mode == 'max':
+            improved = score > self.best_score + self.min_delta
+        else:
+            improved = score < self.best_score - self.min_delta
+            
+        if improved:
+            self.best_score = score
+            self.epochs_no_improve = 0
+            self.best_model_state = model.state_dict().copy()
+        else:
+            self.epochs_no_improve += 1
+            
+        if self.epochs_no_improve >= self.patience:
+            self.should_stop = True
+            
+        return self.should_stop
+
+class ImprovedFocalLoss(nn.Module):
+    """Focal Loss，增加数值稳定性 + α"""
+    
+    def __init__(self, alpha=0.6, gamma=1.5, reduction='mean', eps=1e-8, 
+                 use_dynamic_alpha=True, min_alpha=0.25, max_alpha=0.75):
+        super(ImprovedFocalLoss, self).__init__()
+        self.alpha = alpha  # 备用固定值
+        self.gamma = gamma
+        self.reduction = reduction
+        self.eps = eps
+        
+        # 新增动态α参数
+        self.use_dynamic_alpha = use_dynamic_alpha
+        self.min_alpha = min_alpha
+        self.max_alpha = max_alpha
+        
+    def forward(self, inputs, targets):
+        inputs = torch.clamp(inputs, min=-10, max=10)
+        probs = torch.sigmoid(inputs)
+        probs = torch.clamp(probs, min=self.eps, max=1-self.eps)
+        
+        ce_loss = -(targets * torch.log(probs) + (1 - targets) * torch.log(1 - probs))
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        p_t = torch.clamp(p_t, min=self.eps, max=1-self.eps)
+        
+        #  关键修改：动态计算alpha_t
+        if self.use_dynamic_alpha:
+            # 计算当前批次的样本分布
+            batch_size = targets.size(0)
+            pos_count = targets.sum().float()
+            neg_count = batch_size - pos_count
+            
+            # 动态α = 负样本比例（给正样本更多权重）
+            if batch_size > 0:
+                dynamic_alpha = neg_count / batch_size
+                # 限制α的范围，避免极端值
+                dynamic_alpha = torch.clamp(dynamic_alpha, 
+                                          min=self.min_alpha, 
+                                          max=self.max_alpha)
+            else:
+                dynamic_alpha = torch.tensor(self.alpha).to(targets.device)
+            
+            # 应用动态α
+            alpha_t = dynamic_alpha * targets + (1 - dynamic_alpha) * (1 - targets)
+        else:
+            # 使用固定α（原来的方式）
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        
+        focal_weight = (1 - p_t) ** self.gamma
+        focal_loss = alpha_t * focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# ========== 的位置编码（）==========
+class SimplifiedPositionalEncoding(nn.Module):
+    def __init__(self, d_model=64, seq_len=72):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(0.2)
+        
+        self.temporal_pe = self.create_stable_temporal_encoding(seq_len, d_model)
+        self.spatial_pe = self.create_stable_spatial_encoding(d_model)
+        
+    def create_stable_temporal_encoding(self, seq_len, d_model):
+        pe = torch.zeros(seq_len, d_model)
+        position = torch.arange(0, seq_len).unsqueeze(1).float()
+        
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                           -(math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)  # 移除0.1
+        pe[:, 1::2] = torch.cos(position * div_term)  # 移除0.1
+        
+        return nn.Parameter(pe, requires_grad=False)
+    
+    def create_stable_spatial_encoding(self, d_model):
+        spatial_encodings = []
+        
+        for row in range(4):
+            for col in range(8):
+                pos_encoding = torch.zeros(d_model)
+                
+                if d_model >= 2:
+                    pos_encoding[:d_model//2] = row / 4.0  # 移除0.1
+                    pos_encoding[d_model//2:] = col / 8.0  # 移除0.1
+                
+                spatial_encodings.append(pos_encoding)
+        
+        spatial_pe = torch.stack(spatial_encodings)
+        return nn.Parameter(spatial_pe, requires_grad=True)
+    
+    def forward(self, bit_features, micro_features):
+        batch_size, seq_len = bit_features.shape[:2]
+        device = bit_features.device
+        
+        temporal_enc = self.temporal_pe.to(device).unsqueeze(0).unsqueeze(2)
+        spatial_enc = self.spatial_pe.to(device).unsqueeze(0).unsqueeze(0)
+        
+        # 标准Transformer做法：直接相加
+        bit_encoded = bit_features + temporal_enc + spatial_enc
+        micro_encoded = micro_features + temporal_enc
+        
+        return self.dropout(bit_encoded), self.dropout(micro_encoded)
+class FusedSpatioTemporalLayer(nn.Module):
+    """
+    单层融合时空注意力（优化版）
+    处理流程：空间attention → 时间attention → 序列级门控 → FFN
+    """
+    
+    def __init__(self, d_model=64, num_heads=2):
+        super().__init__()
+        self.d_model = d_model
+        
+        # 空间注意力（带mask）
+        self.spatial_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=max(1, num_heads//2),
+            batch_first=True,
+            dropout=0.2
+        )
+        
+        # 时间注意力
+        self.temporal_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.2
+        )
+        
+        # LayerNorm（）
+        self.norm2 = nn.LayerNorm(d_model, eps=1e-6)  # 时间attention用
+        self.norm3 = nn.LayerNorm(d_model, eps=1e-6)  # FFN用
+        
+        # FFN（一个）
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(0.2)
+        )
+        
+        # 序列级门控（基于整个时空序列）
+        self.gate_network = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(d_model // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """权重初始化"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.3)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # 门控初始化：bias=0 → sigmoid(0)=0.5 → exp(0)=1.0
+        final_layer = self.gate_network[-2]
+        nn.init.zeros_(final_layer.weight)
+        nn.init.constant_(final_layer.bias, 0.0)
+    
+    def exponential_gate_transform(self, gate_score):
+        """指数门控变换: G(L) ∈ [0,1] → exp(G(L) - 0.5)"""
+        return torch.exp(gate_score - 0.5)
+    
+    def apply_spatial_attention(self, features, spatial_mask):
+        """
+        对每个时间步应用空间attention
+
+        """
+        batch_size, seq_len, num_spatial, d_model = features.shape
+        spatial_list = []
+        
+        for t in range(seq_len):
+            feat_t = features[:, t, :, :]  # [batch, 32, d_model]
+            attn_out, _ = self.spatial_attn(feat_t, feat_t, feat_t, attn_mask=spatial_mask)
+            spatial_list.append(attn_out)
+        
+        spatial_out = torch.stack(spatial_list, dim=1)  
+        return spatial_out
+    
+    def apply_temporal_attention(self, features):
+        """
+        对每个空间位置应用时间attention
+
+        """
+        batch_size, seq_len, num_spatial, d_model = features.shape
+        
+   
+        features_transposed = features.transpose(1, 2)
+        temporal_list = []
+        
+        for s in range(num_spatial):
+            feat_s = features_transposed[:, s, :, :]  
+            attn_out, _ = self.temporal_attn(feat_s, feat_s, feat_s)
+            temporal_list.append(attn_out)
+        
+
+        temporal_out = torch.stack(temporal_list, dim=1).transpose(1, 2)
+        return temporal_out
+    
+    def forward(self, features, spatial_mask):
+        """
+
+        """
+        # Step 1: 空间attention（无norm，无残差）
+        spatial_out = self.apply_spatial_attention(features, spatial_mask)
+        spatial_out = torch.clamp(spatial_out, min=-3.0, max=3.0)
+        
+        # Step 2: 时间attention（Pre-Norm + 残差）
+        temporal_attn_out = self.apply_temporal_attention(spatial_out)  # 先计算attention
+        temporal_out = spatial_out + 0.1 * self.norm2(temporal_attn_out)  # Pre-Norm + 残差
+        temporal_out = torch.clamp(temporal_out, min=-3.0, max=3.0)
+        
+        # Step 3: 序列级门控（基于完整的时空特征）
+        global_feat = temporal_out.mean(dim=[1, 2])  # [batch, d_model]
+        gate_score = self.gate_network(global_feat)  # [batch, 1]
+        gate_weight = self.exponential_gate_transform(gate_score)  # [batch, 1]
+        
+        # Step 4: FFN（Pre-Norm + 门控调节的残差）
+        ffn_out = self.ffn(temporal_out)  # 先计算FFN
+        final_out = temporal_out + gate_weight.view(-1, 1, 1, 1) * self.norm3(ffn_out)  # Pre-Norm + 门控残差
+        final_out = torch.clamp(final_out, min=-3.0, max=3.0)
+        
+        return final_out
+
+
+# ========== 多层融合时空注意力 ==========
+class FusedSpatioTemporalAttention(nn.Module):
+    """
+    多层融合时空注意力模块（bit特征专用）
+    包含num_layers层FusedSpatioTemporalLayer
+    """
+    
+    def __init__(self, d_model=64, num_heads=2, num_layers=2):
+        super().__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+        
+        # 多层时空attention
+        self.layers = nn.ModuleList([
+            FusedSpatioTemporalLayer(d_model, num_heads) 
+            for _ in range(num_layers)
+        ])
+        
+        print(f"  融合时空注意力初始化:")
+        print(f"   层数: {num_layers}")
+    
+    def create_spatial_mask(self, device):
+        """创建4×8空间邻接mask"""
+        mask = torch.zeros(32, 32, device=device)
+        
+        for i in range(4):      
+            for j in range(8):  
+                pos = i * 8 + j  
+                neighbors = [pos]  
+                if i > 0: neighbors.append((i-1) * 8 + j)      
+                if i < 3: neighbors.append((i+1) * 8 + j)      
+                if j > 0: neighbors.append(i * 8 + (j-1))      
+                if j < 7: neighbors.append(i * 8 + (j+1))      
+                
+                for neighbor in neighbors:
+                    mask[pos, neighbor] = 1
+                    
+        return (mask == 0)  # 返回bool mask（True表示mask掉）
+    
+    def forward(self, bit_features):
+        """
+
+        """
+        device = bit_features.device
+        spatial_mask = self.create_spatial_mask(device)
+        
+        current_features = bit_features
+        
+        # 多层处理
+        for layer_idx, layer in enumerate(self.layers):
+            current_features = layer(current_features, spatial_mask)
+        
+        return current_features
+
+
+# ========== 改进的双重注意力块（使用融合时空注意力）==========
+class ImprovedDualAttentionBlock(nn.Module):
+    """
+    双重注意力机制
+    - bit特征: 使用融合时空注意力（FusedSpatioTemporalAttention）
+    - micro特征: 使用时间注意力（_apply_temporal_attention）
+    """
+    
+    def __init__(self, d_model=64, num_heads=2, num_spatial_layers=2):
+        super().__init__()
+        self.d_model = d_model
+        self.num_spatial_layers = num_spatial_layers
+        
+        # bit特征用融合时空注意力
+        self.fused_spatiotemporal_attn = FusedSpatioTemporalAttention(
+            d_model=d_model, 
+            num_heads=num_heads, 
+            num_layers=num_spatial_layers
+        )
+        
+        # micro特征用时间注意力
+        self.temporal_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.2
+        )
+        
+        # LayerNorm（时间注意力用）
+        self.norm3 = nn.LayerNorm(d_model, eps=1e-6)
+        self.norm4 = nn.LayerNorm(d_model, eps=1e-6)
+        
+        # 时间注意力的FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(d_model, d_model),
+            nn.Dropout(0.2)
+        )
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        """权重初始化"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.3)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, bit_features, micro_features):
+        """
+
+        """
+        # === 1. bit特征：融合时空注意力 ===
+        enhanced_bit_features = self.fused_spatiotemporal_attn(bit_features)
+        
+        # === 2. micro特征：时间注意力 ===
+        final_micro_features = self._apply_temporal_attention(micro_features)
+        
+        return enhanced_bit_features, final_micro_features
+    
+    def _apply_temporal_attention(self, features):
+        """
+
+        batch_size, seq_len, num_features, d_model = features.shape
+        features_reshaped = features.permute(0, 2, 1, 3).contiguous()
+        temporal_list = []
+        
+        for f in range(num_features):
+            feature_seq = features_reshaped[:, f, :, :]  # [batch, 72, d_model]
+            
+            temporal_out, _ = self.temporal_attn(feature_seq, feature_seq, feature_seq)
+            temporal_out = self.norm3(feature_seq + 0.1 * temporal_out)
+            
+            # FFN
+            ffn_out = self.ffn(temporal_out)
+            temporal_out = self.norm4(temporal_out + 0.1 * ffn_out)
+            
+            temporal_list.append(temporal_out)
+        
+        final_features = torch.stack(temporal_list, dim=2)
+        return final_features
+
+# ========== STransformer ==========
+class SimplifiedSTIMTransformer(nn.Module):
+    """ Transformer -"""
+    
+    def __init__(self, config: STIMConfig):
+        super(SimplifiedSTIMTransformer, self).__init__()
+        
+        self.config = config
+        self.d_model = config.d_model
+        self.sequence_length = config.observation_hours
+        
+        # 输入标准化
+        self.input_norm = nn.LayerNorm(44, eps=1e-6)
+        
+        # 特征投影层
+        self.bit_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, self.d_model),
+                nn.LayerNorm(self.d_model)  
+            ) for _ in range(32)
+        ])
+        
+        self.micro_embeddings = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1, self.d_model),
+                nn.LayerNorm(self.d_model)  
+            ) for _ in range(12)
+        ])
+        
+        # 位置编码
+        self.positional_encoding = SimplifiedPositionalEncoding(
+            d_model=self.d_model, 
+            seq_len=self.sequence_length
+        )
+        
+        # 注意力层
+        self.dual_attention_layers = nn.ModuleList([
+            ImprovedDualAttentionBlock(self.d_model, config.num_heads, config.num_spatial_layers) 
+            for _ in range(config.num_layers)
+        ])
+        
+        # 特征融合（直接拼接）
+        self.feature_fusion = nn.Sequential(
+            nn.LayerNorm(self.d_model*2, eps=1e-6),
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.LayerNorm(self.d_model, eps=1e-6)
+        )
+        
+        # # 简单的最终编码器
+        # encoder_layer = nn.TransformerEncoderLayer(
+        #     d_model=self.d_model,
+        #     nhead=config.num_heads,
+        #     dim_feedforward=self.d_model,
+        #     dropout=config.dropout,
+        #     activation='gelu',
+        #     batch_first=True,
+        #     norm_first=True
+        # )
+        # self.final_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        
+        # 分类器
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.d_model, eps=1e-6),
+            nn.Dropout(config.dropout),
+            nn.Linear(self.d_model, self.d_model // 4),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(self.d_model // 4, 1)
+        )
+        
+        # 权重初始化
+        self._init_weights_conservatively()
+        
+    def _create_stable_projection(self, input_dim, output_dim):
+        """创建数值稳定的投影层"""
+        layer = nn.Linear(input_dim, output_dim)
+        nn.init.xavier_uniform_(layer.weight, gain=1.0)
+        nn.init.zeros_(layer.bias)
+        return layer
+    
+    def _init_weights_conservatively(self):
+        """保守的权重初始化"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.3)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # 分类器特殊处理
+        positive_ratio = 0.2
+        initial_bias = np.log(positive_ratio / (1 - positive_ratio))
+        
+        classifier_final = self.classifier[-1]
+        nn.init.normal_(classifier_final.weight, mean=0, std=0.005)
+        nn.init.constant_(classifier_final.bias, initial_bias)
+        
+        print(f"🔧 模型初始化: 分类器bias={initial_bias:.3f}")
+    
+    def reorder_features(self, x):
+        """重排特征"""
+        bit_features = x[:, :, :32]
+        micro_features = x[:, :, 32:]
+        return bit_features, micro_features
+    
+    def project_features_safely(self, bit_features, micro_features):
+        """安全的特征投影"""
+        batch_size, seq_len = bit_features.shape[:2]
+        
+        # 投影bit特征
+        bit_projected_list = []
+        for bit_idx in range(32):
+            bit_single = bit_features[:, :, bit_idx:bit_idx+1]
+            bit_embedded = self.bit_embeddings[bit_idx](bit_single)
+            bit_embedded = torch.clamp(bit_embedded, min=-4.0, max=4.0)
+            bit_projected_list.append(bit_embedded)
+        
+        bit_projected = torch.stack(bit_projected_list, dim=2)
+        
+        # 投影微观特征
+        micro_projected_list = []
+        for micro_idx in range(12):
+            micro_single = micro_features[:, :, micro_idx:micro_idx+1]
+            micro_embedded = self.micro_embeddings[micro_idx](micro_single)
+            micro_embedded = torch.clamp(micro_embedded, min=-6.0, max=6.0)
+            micro_projected_list.append(micro_embedded)
+        
+        micro_projected = torch.stack(micro_projected_list, dim=2)
+        
+        return bit_projected, micro_projected
+    
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        
+        # 输入标准化
+        x = self.input_norm(x)
+        
+        # 特征重排和投影
+        bit_features, micro_features = self.reorder_features(x)
+        bit_projected, micro_projected = self.project_features_safely(bit_features, micro_features)
+        
+        # 位置编码
+        bit_encoded, micro_encoded = self.positional_encoding(bit_projected, micro_projected)
+        
+        # 双重注意力处理
+        current_bit_features = bit_encoded
+        current_micro_features = micro_encoded
+        
+        for layer in self.dual_attention_layers:
+            current_bit_features, current_micro_features = layer(
+                current_bit_features, current_micro_features
+            )
+            
+            # 每层后裁剪数值范围
+            current_bit_features = torch.clamp(current_bit_features, min=-3.0, max=3.0)
+            current_micro_features = torch.clamp(current_micro_features, min=-3.0, max=3.0)
+        
+        # 特征融合（直接拼接）
+        fused_features = []
+        for t in range(seq_len):
+            bit_t = current_bit_features[:, t, :, :].mean(dim=1)  # 平均池化
+            micro_t = current_micro_features[:, t, :, :].mean(dim=1)  # 平均池化
+            
+            # 直接拼接（不用注意力）
+            combined_t = torch.cat([bit_t, micro_t], dim=1)
+            fused_t = self.feature_fusion(combined_t)
+            fused_t = torch.clamp(fused_t, min=-2.0, max=2.0)
+            fused_features.append(fused_t)
+        
+        fused_sequence = torch.stack(fused_features, dim=1)
+        
+        # 最终序列建模
+        # final_output = self.final_encoder(fused_sequence)
+        
+        # 池化和分类
+        # pooled = final_output.mean(dim=1)
+        pooled = fused_sequence.mean(dim=1)  #   直接使用 fused_sequence
+
+        output = self.classifier(pooled)
+        
+        # 最终输出裁剪
+        output = torch.clamp(output, min=-5.0, max=5.0)
+        
+        return output.squeeze(-1)
+
+# ========== 数据生成器和数据集类（保持不变）==========
+class STIMDataGenerator(metaclass=abc.ABCMeta):
+    """STIM数据生成器基类"""
+    
+    def __init__(self, config: STIMConfig):
+        self.config = config
+        self.feature_path = self.config.feature_path
+        self.train_data_path = self.config.train_data_path
+        self.test_data_path = self.config.test_data_path
+        self.ticket_path = self.config.ticket_path
+        
+        # 时间戳转换
+        self.train_start_date = self._datetime_to_timestamp(self.config.train_date_range[0])
+        self.train_end_date = self._datetime_to_timestamp(self.config.train_date_range[1])
+        self.test_start_date = self._datetime_to_timestamp(self.config.test_data_range[0])
+        self.test_end_date = self._datetime_to_timestamp(self.config.test_data_range[1])
+        
+        # 读取故障票据
+        ticket_full = pd.read_csv(self.ticket_path)
+        print(f"完整故障票据总数: {len(ticket_full)}")
+        
+
+        # 创建目录
+        os.makedirs(self.config.train_data_path, exist_ok=True)
+        os.makedirs(self.config.test_data_path, exist_ok=True)
+    
+    @staticmethod
+    def _datetime_to_timestamp(date: str) -> int:
+        """将 %Y-%m-%d 格式的日期转换为时间戳"""
+        return int(datetime.strptime(date, "%Y-%m-%d").timestamp())
+    
+    def fix_feature_order(self, feature_columns):
+        """修复特征顺序，确保bit特征按正确顺序排列"""
+        bit_features = []
+        micro_features = []
+        
+        for col in feature_columns:
+            if col.startswith('bit_'):
+                bit_features.append(col)
+            else:
+                micro_features.append(col)
+        
+        # 按正确顺序排列bit特征
+        bit_features_sorted = []
+        for i in range(32):
+            bit_name = f'bit_{i}'
+            if bit_name in bit_features:
+                bit_features_sorted.append(bit_name)
+        
+        micro_features.sort()
+        correct_order = bit_features_sorted + micro_features
+        
+        return correct_order
+    
+    def _load_stim_sequences(self, sn_file: str, stride: int = 24) -> Tuple[List[np.ndarray], List[int], List[str]]:
+        """加载STIM连续时间序列"""
+        try:
+            if sn_file.endswith('.feather'):
+                data = pd.read_feather(os.path.join(self.feature_path, sn_file))
+            else:
+                data = pd.read_csv(os.path.join(self.feature_path, sn_file))
+            
+            if data.empty or 'LogTime' not in data.columns or 'sn_name' not in data.columns:
+                return [], [], []
+            
+            data = data.sort_values('LogTime').reset_index(drop=True)
+            
+            meta_columns = ['LogTime', 'sn_name']
+            feature_columns = [col for col in data.columns if col not in meta_columns]
+            feature_columns = self.fix_feature_order(feature_columns)
+            
+            if len(feature_columns) != 44:
+                print(f"警告: {sn_file} 特征数量不是44个，是{len(feature_columns)}个")
+                return [], [], []
+            
+            sequences = []
+            timestamps = []
+            sn_names = []
+            
+            observation_hours = self.config.observation_hours
+            
+            for i in range(0, len(data) - observation_hours + 1, stride):
+                window_data = data.iloc[i:i + observation_hours]
+                
+                time_diffs = np.diff(window_data['LogTime'].values)
+                if not np.all(time_diffs == 3600):
+                    continue
+                
+                sequence = window_data[feature_columns].values.astype(np.float32)
+                
+                if sequence.shape == (observation_hours, len(feature_columns)):
+                    sequences.append(sequence)
+                    timestamps.append(int(window_data['LogTime'].iloc[-1]))
+                    sn_names.append(window_data['sn_name'].iloc[0])
+            
+            return sequences, timestamps, sn_names
+        
+        except Exception as e:
+            print(f"Error loading {sn_file}: {e}")
+            return [], [], []
+    
+    def _get_data(self) -> Tuple[List[np.ndarray], List[int], List[str]]:
+        """获取所有数据"""
+        file_list = os.listdir(self.feature_path)
+        file_list = [x for x in file_list if x.endswith("_stim_modified.feather") or x.endswith("_stim_modified.csv")]
+        file_list.sort()
+        
+        all_sequences = []
+        all_timestamps = []
+        all_sn_names = []
+        
+        if self.config.USE_MULTI_PROCESS:
+            worker_num = self.config.WORKER_NUM
+            with Pool(worker_num) as pool:
+                results = list(tqdm(
+                    pool.imap(self._process_file, file_list),
+                    total=len(file_list),
+                    desc="Processing STIM files"
+                ))
+            
+            for sequences, timestamps, sn_names in results:
+                all_sequences.extend(sequences)
+                all_timestamps.extend(timestamps)
+                all_sn_names.extend(sn_names)
+        else:
+            for file in tqdm(file_list, desc="Processing STIM files"):
+                sequences, timestamps, sn_names = self._process_file(file)
+                all_sequences.extend(sequences)
+                all_timestamps.extend(timestamps)
+                all_sn_names.extend(sn_names)
+        
+        return all_sequences, all_timestamps, all_sn_names
+    
+    @abc.abstractmethod
+    def _process_file(self, sn_file):
+        """处理单个文件，子类需要实现"""
+        raise NotImplementedError("Subclasses should implement this method")
+    
+    @abc.abstractmethod
+    def generate_and_save_data(self):
+        """生成并保存数据，子类需要实现"""
+        raise NotImplementedError("Subclasses should implement this method")
+
+class STIMSequenceDataset(Dataset):
+    """STIM时序数据集"""
+    
+    def __init__(self, sequences, labels=None):
+        self.sequences = sequences
+        self.labels = labels
+        self._validate_and_preprocess_data()
+        
+    def _validate_and_preprocess_data(self):
+        """改进的数据预处理""" 
+        print("验证数据质量...")
+        valid_sequences = []
+        valid_labels = [] if self.labels is not None else None
+        
+        for i, seq in enumerate(self.sequences):
+            # 处理异常值
+            seq = np.nan_to_num(seq, nan=0.0, posinf=2.0, neginf=-2.0)
+            
+            # 逐特征标准化
+            for feature_idx in range(seq.shape[1]):
+                feature_data = seq[:, feature_idx]
+                feature_mean = feature_data.mean()
+                feature_std = feature_data.std()
+                
+                if feature_std > 1e-6:
+                    seq[:, feature_idx] = (feature_data - feature_mean) / feature_std
+                else:
+                    seq[:, feature_idx] = 0
+            
+            # 更严格的数值范围限制
+            seq = np.clip(seq, -2.0, 2.0)
+            
+            # 最终检查
+            if np.any(np.isnan(seq)) or np.any(np.isinf(seq)):
+                continue
+                
+            valid_sequences.append(seq.astype(np.float32))
+            if self.labels is not None:
+                valid_labels.append(self.labels[i])
+        
+        self.sequences = valid_sequences
+        if self.labels is not None:
+            self.labels = valid_labels
+        
+        print(f"  处理后有效序列数: {len(self.sequences)}")
+        
+        # 统计预处理后的数据分布
+        if self.sequences:
+            all_data = np.concatenate([seq.flatten() for seq in self.sequences[:100]])
+            print(f"预处理后数据分布: min={all_data.min():.3f}, max={all_data.max():.3f}, "
+                f"mean={all_data.mean():.3f}, std={all_data.std():.3f}")
+        
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        sequence = torch.FloatTensor(self.sequences[idx])
+        
+        if self.labels is not None:
+            label = torch.FloatTensor([self.labels[idx]])
+            return sequence, label
+        else:
+            return sequence
+
+# ========== 数据生成器实现类 ==========
+class STIMPositiveDataGenerator(STIMDataGenerator):
+    def _process_file(self, sn_file: str) -> Tuple[List[np.ndarray], List[int], List[str]]:
+        if sn_file.endswith('_stim_modified.feather'):
+            sn_name = sn_file.replace('_stim_modified.feather', '')
+        elif sn_file.endswith('_stim_modified.csv'):
+            sn_name = sn_file.replace('_stim_modified.csv', '')
+        else:
+            return [], [], []
+        
+        if sn_name not in self.ticket_sn_map:
+            return [], [], []
+        
+        sequences, timestamps, sn_names = self._load_stim_sequences(sn_file, stride=24)
+        
+        if not sequences:
+            return [], [], []
+        
+        failure_time = self.ticket_sn_map[sn_name]
+        start_time = failure_time - 5 * ONE_DAY
+        
+        valid_sequences = []
+        valid_timestamps = []
+        valid_sn_names = []
+        
+        for seq, ts, sn in zip(sequences, timestamps, sn_names):
+            if start_time <= ts <= failure_time:
+                valid_sequences.append(seq)
+                valid_timestamps.append(ts)
+                valid_sn_names.append(sn)
+        
+        return valid_sequences, valid_timestamps, valid_sn_names
+    
+    def generate_and_save_data(self) -> NoReturn:
+        sequences, timestamps, sn_names = self._get_data()
+        
+        if sequences:
+            data = {
+                'sequences': np.array(sequences),
+                'timestamps': np.array(timestamps),
+                'sn_names': np.array(sn_names),
+                'labels': np.ones(len(sequences))
+            }
+            np.savez(os.path.join(self.train_data_path, "positive_train_stim.npz"), **data)
+            print(f"生成正样本数据: {len(sequences)} 个72小时序列")
+
+class STIMNegativeDataGenerator(STIMDataGenerator):
+    def _process_file(self, sn_file: str) -> Tuple[List[np.ndarray], List[int], List[str]]:
+        if sn_file.endswith('_stim_modified.feather'):
+            sn_name = sn_file.replace('_stim_modified.feather', '')
+        elif sn_file.endswith('_stim_modified.csv'):
+            sn_name = sn_file.replace('_stim_modified.csv', '')
+        else:
+            return [], [], []
+        
+        if sn_name in self.ticket_sn_map:
+            return [], [], []
+        
+        sequences, timestamps, sn_names = self._load_stim_sequences(sn_file)
+        
+        if not sequences:
+            return [], [], []
+        
+        start_time = int(datetime(2024, 2, 21).timestamp())
+        end_time = int(datetime(2024, 2, 22).timestamp())
+        
+        valid_sequences = []
+        valid_timestamps = []
+        valid_sn_names = []
+        
+        for seq, ts, sn in zip(sequences, timestamps, sn_names):
+            if start_time <= ts <= end_time:
+                valid_sequences.append(seq)
+                valid_timestamps.append(ts)
+                valid_sn_names.append(sn)
+        
+        return valid_sequences, valid_timestamps, valid_sn_names
+    
+    def generate_and_save_data(self) -> NoReturn:
+        sequences, timestamps, sn_names = self._get_data()
+        
+        if sequences:
+            data = {
+                'sequences': np.array(sequences),
+                'timestamps': np.array(timestamps),
+                'sn_names': np.array(sn_names),
+                'labels': np.zeros(len(sequences))
+            }
+            np.savez(os.path.join(self.train_data_path, "negative_train_stim.npz"), **data)
+            print(f"生成负样本数据: {len(sequences)} 个72小时序列")
+
+class STIMValidationDataGenerator(STIMDataGenerator):
+    def _process_file(self, sn_file: str) -> Tuple[List[np.ndarray], List[int], List[str], List[int]]:
+        if sn_file.endswith('_stim_modified.feather'):
+            sn_name = sn_file.replace('_stim_modified.feather', '')
+        elif sn_file.endswith('_stim_modified.csv'):
+            sn_name = sn_file.replace('_stim_modified.csv', '')
+        else:
+            return [], [], [], []
+            
+        sequences, timestamps, sn_names = self._load_stim_sequences(sn_file)
+        
+        if not sequences:
+            return [], [], [], []
+        
+        valid_sequences = []
+        valid_timestamps = []
+        valid_sn_names = []
+        valid_labels = []
+        
+        neg_start_time = int(datetime(2024, 3, 21).timestamp())
+        neg_end_time = int(datetime(2024, 3, 22).timestamp())
+        
+        for seq, ts, sn in zip(sequences, timestamps, sn_names):
+            if self.val_start_date <= ts <= self.val_end_date:
+                if sn in self.ticket_sn_map:
+                    failure_time = self.ticket_sn_map[sn]
+                    if (failure_time - 5 * ONE_DAY) <= ts <= failure_time:
+                        valid_sequences.append(seq)
+                        valid_timestamps.append(ts)
+                        valid_sn_names.append(sn)
+                        valid_labels.append(1)
+            
+            elif neg_start_time <= ts <= neg_end_time:
+                if sn not in self.ticket_sn_map:
+                    valid_sequences.append(seq)
+                    valid_timestamps.append(ts)
+                    valid_sn_names.append(sn)
+                    valid_labels.append(0)
+        
+        return valid_sequences, valid_timestamps, valid_sn_names, valid_labels
+    
+    def generate_and_save_data(self) -> NoReturn:
+        file_list = os.listdir(self.feature_path)
+        file_list = [x for x in file_list if x.endswith("_stim_modified.feather") or x.endswith("_stim_modified.csv")]
+        file_list.sort()
+        
+        all_sequences = []
+        all_timestamps = []
+        all_sn_names = []
+        all_labels = []
+        
+        if self.config.USE_MULTI_PROCESS:
+            worker_num = self.config.WORKER_NUM
+            with Pool(worker_num) as pool:
+                results = list(tqdm(
+                    pool.imap(self._process_file, file_list),
+                    total=len(file_list),
+                    desc="Processing validation files"
+                ))
+            
+            for sequences, timestamps, sn_names, labels in results:
+                all_sequences.extend(sequences)
+                all_timestamps.extend(timestamps)
+                all_sn_names.extend(sn_names)
+                all_labels.extend(labels)
+        else:
+            for file in tqdm(file_list, desc="Processing validation files"):
+                sequences, timestamps, sn_names, labels = self._process_file(file)
+                all_sequences.extend(sequences)
+                all_timestamps.extend(timestamps)
+                all_sn_names.extend(sn_names)
+                all_labels.extend(labels)
+        
+        if all_sequences:
+            positive_indices = [i for i, label in enumerate(all_labels) if label == 1]
+            negative_indices = [i for i, label in enumerate(all_labels) if label == 0]
+            
+            max_negative_samples = len(positive_indices) * 4
+            if len(negative_indices) > max_negative_samples:
+                negative_indices = np.random.choice(
+                    negative_indices, 
+                    max_negative_samples, 
+                    replace=False
+                ).tolist()
+            
+            selected_indices = positive_indices + negative_indices
+            np.random.shuffle(selected_indices)
+            
+            final_sequences = [all_sequences[i] for i in selected_indices]
+            final_timestamps = [all_timestamps[i] for i in selected_indices]
+            final_sn_names = [all_sn_names[i] for i in selected_indices]
+            final_labels = [all_labels[i] for i in selected_indices]
+            
+            data = {
+                'sequences': np.array(final_sequences),
+                'timestamps': np.array(final_timestamps),
+                'sn_names': np.array(final_sn_names),
+                'labels': np.array(final_labels)
+            }
+            print(f"最终验证数据: {len(final_sequences)} 个72小时序列")
+
+class STIMTestDataGenerator(STIMDataGenerator):
+    def _process_file(self, sn_file: str) -> Tuple[List[np.ndarray], List[int], List[str]]:
+        sequences, timestamps, sn_names = self._load_stim_sequences(sn_file)
+        
+        if not sequences:
+            return [], [], []
+        
+        valid_sequences = []
+        valid_timestamps = []
+        valid_sn_names = []
+        
+        for seq, ts, sn in zip(sequences, timestamps, sn_names):
+            if self.test_start_date <= ts <= self.test_end_date:
+                valid_sequences.append(seq)
+                valid_timestamps.append(ts)
+                valid_sn_names.append(sn)
+        
+        return valid_sequences, valid_timestamps, valid_sn_names
+    
+    def generate_and_save_data(self) -> NoReturn:
+        sequences, timestamps, sn_names = self._get_data()
+        
+        if sequences:
+            chunk_size = 10000
+            for i in range(0, len(sequences), chunk_size):
+                end_idx = min(i + chunk_size, len(sequences))
+                
+                data = {
+                    'sequences': np.array(sequences[i:end_idx]),
+                    'timestamps': np.array(timestamps[i:end_idx]),
+                    'sn_names': np.array(sn_names[i:end_idx])
+                }
+                
+                np.savez(os.path.join(self.test_data_path, f"test_stim_{i//chunk_size}.npz"), **data)
+            
+            print(f"生成测试数据: {len(sequences)} 个72小时序列")
+
+# ========== STIM模型类 ==========
+class SimplifiedSTIMModel(object):
+    """STIM模型类 - """
+    
+    def __init__(self, config: STIMConfig):
+        self.config = config
+        self.train_data_path = config.train_data_path
+        self.test_data_path = config.test_data_path
+        self.device = torch.device(config.device)
+        
+        # 使用的模型
+        self.model = SimplifiedSTIMTransformer(config).to(self.device)
+        
+        # 优化器设置
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=config.learning_rate,
+            weight_decay=0.005,
+            eps=1e-8,
+            betas=(0.9, 0.999)
+        )
+        
+        # 学习率调度器
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode='min',
+            factor=0.95,        # 更温和的衰减
+            patience=8,        # 更有耐心
+            verbose=True,
+            min_lr=1e-7       # 更低的最小学习率
+        )
+        
+        # 损失函数
+        self.criterion = ImprovedFocalLoss(
+            alpha=config.focal_alpha, 
+            gamma=config.focal_gamma, 
+            reduction='mean',
+            use_dynamic_alpha=config.use_dynamic_alpha,  #   从配置读取
+            min_alpha=config.min_alpha,                  #   从配置读取  
+            max_alpha=config.max_alpha  
+        )
+        
+        # 早停机制
+        self.early_stopping = EarlyStopping(
+            patience=config.early_stopping_patience,
+            min_delta=config.early_stopping_min_delta,
+            mode='max'
+        )
+        
+        # 数据存储
+        self.train_sequences = None
+        self.train_labels = None
+        self.train_metadata = None
+        self.val_sequences = None
+        self.val_labels = None
+        self.val_loader = None
+        
+        # 训练历史
+        self.train_history = {
+            'train_loss': [], 'train_f1': [], 'train_precision': [], 'train_recall': [],
+            'val_loss': [], 'val_f1': [], 'val_precision': [], 'val_recall': [],
+            'learning_rate': [], 'grad_norm': []
+        }
+        
+        # 稳定训练参数
+        self.gradient_clip_norm = 0.5    
+        print(f"   学习率: {config.learning_rate:.2e}")
+        print(f"   梯度裁剪: {self.gradient_clip_norm}")
+        self._test_data_cache = None
+        self._prediction_cache = None
+        self._cache_loaded = False
+    def save_model(self, save_path: str = None):
+        """保存训练好的模型"""
+        if save_path is None:
+            # 创建带时间戳的模型保存路径
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = f"/home/cgh723412/内存预测/saved_models/stim_model_{timestamp}.pth"
+        
+        # 确保保存目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # 保存模型状态和配置
+        save_dict = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'config': self.config.__dict__,
+            'train_history': self.train_history,
+            'best_f1_score': self.early_stopping.best_score,
+            'current_epoch': len(self.train_history['train_loss']) if self.train_history['train_loss'] else 0,
+            'model_class': 'SimplifiedSTIMTransformer'
+        }
+        
+        torch.save(save_dict, save_path)
+        print(f"  模型已保存到: {save_path}")
+        print(f"   最佳F1得分: {self.early_stopping.best_score:.4f}")
+        print(f"   训练轮数: {save_dict['current_epoch']}")
+        
+        return save_path
+
+    def load_model(self, load_path: str):
+        """加载训练好的模型"""
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"模型文件不存在: {load_path}")
+        
+        print(f"  正在加载模型: {load_path}")
+        
+        # 加载保存的数据
+        checkpoint = torch.load(load_path, map_location=self.device)
+        
+        # 验证模型类型
+        if checkpoint.get('model_class') != 'SimplifiedSTIMTransformer':
+            print(" 警告: 模型类型可能不匹配")
+        
+        # 加载模型状态
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 恢复训练历史
+        self.train_history = checkpoint['train_history']
+        
+        # 恢复早停状态
+        self.early_stopping.best_score = checkpoint['best_f1_score']
+        
+        print(f"  模型加载成功!")
+        print(f"   模型类型: {checkpoint.get('model_class', '未知')}")
+        print(f"   最佳F1得分: {checkpoint['best_f1_score']:.4f}")
+        print(f"   训练轮数: {checkpoint['current_epoch']}")
+        print(f"   当前学习率: {self.get_current_lr():.2e}")
+        
+        return checkpoint
+
+    @classmethod
+    def load_pretrained_model(cls, load_path: str, config: STIMConfig = None):
+        """类方法：直接加载预训练模型"""
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"模型文件不存在: {load_path}")
+        
+        # 先加载检查点获取配置
+        checkpoint = torch.load(load_path, map_location='cpu')
+        
+        if config is None:
+            # 从保存的文件中恢复配置
+            saved_config_dict = checkpoint['config']
+            config = STIMConfig(**saved_config_dict)
+            print("📋 从保存文件中恢复配置")
+        
+        # 创建模型实例
+        model = cls(config)
+        
+        # 加载模型
+        model.load_model(load_path)
+        
+        return model
+
+    def get_model_info(self):
+        """获取模型信息摘要"""
+        info = {
+            'model_class': 'SimplifiedSTIMTransformer',
+            'config': self.config.__dict__,
+            'best_f1_score': self.early_stopping.best_score,
+            'current_lr': self.get_current_lr(),
+            'training_epochs': len(self.train_history['train_loss']) if self.train_history['train_loss'] else 0,
+            'device': str(self.device)
+        }
+        return info
+    def _load_and_cache_test_data(self):
+        """一次性加载和预处理所有测试数据"""
+        if self._cache_loaded:
+            print("  使用缓存的测试数据")
+            return
+            
+        print("  首次加载测试数据...")
+        
+        test_files = [f for f in os.listdir(self.test_data_path) 
+                      if f.startswith('test_stim_') and f.endswith('.npz')]
+        
+        all_sequences = []
+        all_timestamps = []
+        all_sn_names = []
+        
+        for file in test_files:
+            try:
+                test_data = np.load(os.path.join(self.test_data_path, file))
+                all_sequences.extend(test_data['sequences'])
+                all_timestamps.extend(test_data['timestamps'])
+                all_sn_names.extend(test_data['sn_names'])
+            except Exception as e:
+                print(f"加载文件 {file} 失败: {e}")
+                continue
+        
+        # 预处理数据（只做一次）
+        print("预处理测试数据...")
+        test_dataset = STIMSequenceDataset(all_sequences)
+        
+        # 缓存预处理后的数据
+        self._test_data_cache = {
+            'dataset': test_dataset,
+            'timestamps': np.array(all_timestamps),
+            'sn_names': np.array(all_sn_names)
+        }
+        
+        self._cache_loaded = True
+        print(f" 测试数据缓存完成: {len(all_sequences)} 个序列")
+    
+    def _compute_and_cache_probabilities(self):
+        """计算并缓存所有概率（只计算一次）"""
+        if self._prediction_cache is not None:
+            print(" 使用缓存的预测概率")
+            return
+            
+        if not self._cache_loaded:
+            self._load_and_cache_test_data()
+            
+        print(" 计算预测概率（仅执行一次）...")
+        
+        self.model.eval()
+        test_dataset = self._test_data_cache['dataset']
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+        
+        all_probabilities = []
+        with torch.no_grad():
+            total_batches = len(test_loader)
+            print(f"  推理进度: 0/{total_batches} (0.0%)", end="")
+
+            for batch_idx, batch_sequences in enumerate(test_loader):
+                batch_sequences = batch_sequences.to(self.device)
+                logits = self.model(batch_sequences)
+                probs = torch.sigmoid(logits)
+                all_probabilities.extend(probs.cpu().numpy())
+                
+                # 在同一行更新进度
+                progress = (batch_idx + 1) / total_batches * 100
+                print(f"\r 推理进度: {batch_idx + 1}/{total_batches} ({progress:.1f}%)", end="", flush=True)
+
+            print("\n  推理完成")
+        
+        # 缓存概率结果
+        self._prediction_cache = {
+            'probabilities': np.array(all_probabilities),
+            'timestamps': self._test_data_cache['timestamps'],
+            'sn_names': self._test_data_cache['sn_names']
+        }
+        
+        print(f"  概率计算完成并缓存: {len(all_probabilities)} 个预测")
+    
+    def predict_proba_cached(self) -> Dict[str, List]:
+        """缓存版本的概率预测"""
+        # 确保概率已计算并缓存
+        self._compute_and_cache_probabilities()
+        
+        result = {}
+        probabilities = self._prediction_cache['probabilities']
+        timestamps = self._prediction_cache['timestamps']
+        sn_names = self._prediction_cache['sn_names']
+        
+        # 组织结果
+        for prob, sn, timestamp in zip(probabilities, sn_names, timestamps):
+            if sn not in result:
+                result[sn] = []
+            result[sn].append({
+                'timestamp': int(timestamp),
+                'datetime': datetime.fromtimestamp(timestamp),
+                'probability': float(prob)
+            })
+        
+        return result
+    
+    def predict_with_threshold(self, threshold: float = 0.9) -> Dict[str, List]:
+        """快速阈值预测（使用缓存的概率）"""
+        # 确保概率已计算并缓存
+        self._compute_and_cache_probabilities()
+        
+        result = {}
+        probabilities = self._prediction_cache['probabilities']
+        timestamps = self._prediction_cache['timestamps']
+        sn_names = self._prediction_cache['sn_names']
+        
+        # 直接在缓存的概率上应用阈值
+        for prob, sn, timestamp in zip(probabilities, sn_names, timestamps):
+            if prob >= threshold:
+                if sn not in result:
+                    result[sn] = []
+                result[sn].append(int(timestamp))
+        
+        print(f"阈值 {threshold}: 预测故障SN数量 = {len(result)}")
+        return result
+    
+    def batch_predict_multiple_thresholds(self, thresholds: List[float]) -> Dict[float, Dict[str, List]]:
+        """批量预测多个阈值（只计算一次概率）"""
+        # 确保概率已计算并缓存
+        self._compute_and_cache_probabilities()
+        
+        results = {}
+        probabilities = self._prediction_cache['probabilities']
+        timestamps = self._prediction_cache['timestamps']
+        sn_names = self._prediction_cache['sn_names']
+        
+        print(f" 批量预测 {len(thresholds)} 个阈值...")
+        
+        for threshold in thresholds:
+            threshold_result = {}
+            
+            for prob, sn, timestamp in zip(probabilities, sn_names, timestamps):
+                if prob >= threshold:
+                    if sn not in threshold_result:
+                        threshold_result[sn] = []
+                    threshold_result[sn].append(int(timestamp))
+            
+            results[threshold] = threshold_result
+            print(f"  阈值 {threshold}: {len(threshold_result)} 个故障SN")
+        
+        return results    
+    @property
+    def best_f1(self):
+        """获取最佳F1分数"""
+        return self.early_stopping.best_score if self.early_stopping.best_score else 0.0
+    
+    def get_current_lr(self):
+        """获取当前学习率"""
+        return self.optimizer.param_groups[0]['lr']
+    
+    def stable_training_step(self, batch_sequences, batch_labels):
+        """数值稳定的训练步骤"""
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        # 前向传播
+        logits = self.model(batch_sequences)
+        
+        # 数值稳定性检查
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(" 检测到NaN/Inf，跳过此batch")
+            return None, None, None, None
+        
+        # 监控logits分布
+        logits_stats = {
+            'min': logits.min().item(),
+            'max': logits.max().item(), 
+            'mean': logits.mean().item(),
+            'std': logits.std().item()
+        }
+        
+        # 计算损失
+        loss = self.criterion(logits, batch_labels)
+        
+        # 反向传播
+        loss.backward()
+        
+        # 梯度裁剪并监控
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), 
+            max_norm=self.gradient_clip_norm
+        )
+        
+        self.optimizer.step()
+        
+        # 计算预测
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            predictions = (probs > 0.5).float()
+        
+        return (loss.item(), predictions.cpu().numpy(), 
+                batch_labels.cpu().numpy(), {'grad_norm': grad_norm.item(), **logits_stats})
+    
+    # 在SimplifiedSTIMModel类中，修改stable_validation_step方法的预测部分
+
+    def stable_validation_step(self):
+        """稳定的验证步骤 - 使用固定阈值"""
+        if self.val_loader is None:
+            raise ValueError("验证DataLoader未初始化")
+
+        self.model.eval()
+        total_loss = 0.0
+        all_predictions = []
+        all_labels = []
+        all_probs = []
+        valid_batches = 0
+
+        #  使用固定阈值
+        VALIDATION_THRESHOLD = 0.5
+
+        with torch.no_grad():
+            for batch_idx, (batch_sequences, batch_labels) in enumerate(self.val_loader):
+                batch_sequences = batch_sequences.to(self.device)
+                batch_labels = batch_labels.squeeze().to(self.device)
+
+                logits = self.model(batch_sequences)
+
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    print(f" 验证batch {batch_idx} 出现NaN/Inf")
+                    continue
+
+                loss = self.criterion(logits, batch_labels)
+                total_loss += loss.item()
+                valid_batches += 1
+
+                probs = torch.sigmoid(logits)
+
+                #  固定阈值预测
+                predictions = (probs > VALIDATION_THRESHOLD).float()
+
+                all_predictions.extend(predictions.cpu().numpy())
+                all_labels.extend(batch_labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+                
+                # 第一个batch的详细信息
+                if batch_idx == 0:
+                    print(f"\n 验证batch 1 统计:")
+                    print(f"   Logits: [{logits.min().item():.3f}, {logits.max().item():.3f}], mean={logits.mean().item():.3f}")
+                    print(f"   Probs: [{probs.min().item():.3f}, {probs.max().item():.3f}], mean={probs.mean().item():.3f}")
+                    print(f"   固定阈值: {VALIDATION_THRESHOLD:.3f}")
+                    print(f"   预测分布: {predictions.sum().item():.0f}/{len(predictions)} 个正类")
+        
+        if valid_batches == 0:
+            print(" 没有有效的验证batch")
+            return float('inf'), 0.0, 0.0, 0.0
+        
+        # 计算指标
+        all_predictions = np.array(all_predictions)
+        all_labels = np.array(all_labels)
+        all_probs = np.array(all_probs)
+        
+        avg_loss = total_loss / valid_batches
+        f1 = f1_score(all_labels, all_predictions, zero_division=0)
+        precision = precision_score(all_labels, all_predictions, zero_division=0)
+        recall = recall_score(all_labels, all_predictions, zero_division=0)
+        
+        # 详细统计
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(all_labels, all_predictions)
+        print(f"\n 验证结果:")
+        print(f"   概率分布: [{all_probs.min():.3f}, {all_probs.max():.3f}], std={all_probs.std():.3f}")
+        print(f"   预测正类比例: {all_predictions.mean()*100:.1f}% (实际: {all_labels.mean()*100:.1f}%)")
+        print(f"   混淆矩阵:\n{cm}")
+        print(f"   F1={f1:.4f}, Precision={precision:.4f}, Recall={recall:.4f}")
+        
+        return avg_loss, f1, precision, recall
+    
+    def load_train_data(self) -> None:
+        """加载训练和验证数据"""
+        try:
+            # 加载正样本
+            pos_data = np.load(os.path.join(self.train_data_path, "positive_train_stim.npz"))
+            pos_sequences = pos_data['sequences']
+            pos_labels = pos_data['labels']
+            pos_timestamps = pos_data['timestamps']
+            pos_sn_names = pos_data['sn_names']
+            
+            # 加载负样本
+            neg_data = np.load(os.path.join(self.train_data_path, "negative_train_stim.npz"))
+            neg_sequences = neg_data['sequences']
+            neg_labels = neg_data['labels']
+            neg_timestamps = neg_data['timestamps']
+            neg_sn_names = neg_data['sn_names']
+            
+            # 数据增强
+            pos_multiplier = min(1, len(neg_sequences) // len(pos_sequences))
+            if pos_multiplier >= 1:
+                print(f"对正样本进行 {pos_multiplier} 倍重复采样")
+                pos_sequences = np.tile(pos_sequences, (pos_multiplier, 1, 1))
+                pos_labels = np.tile(pos_labels, pos_multiplier)
+                pos_timestamps = np.tile(pos_timestamps, pos_multiplier)
+                pos_sn_names = np.tile(pos_sn_names, pos_multiplier)
+            
+            # 合并训练数据
+            self.train_sequences = np.concatenate([pos_sequences, neg_sequences], axis=0)
+            self.train_labels = np.concatenate([pos_labels, neg_labels], axis=0)
+            train_timestamps = np.concatenate([pos_timestamps, neg_timestamps], axis=0)
+            train_sn_names = np.concatenate([pos_sn_names, neg_sn_names], axis=0)
+            
+            self.train_metadata = {
+                'timestamps': train_timestamps,
+                'sn_names': train_sn_names
+            }
+
+            
+
+            
+            print(f"训练数据加载完成:")
+            print(f"  - 训练集正样本: {self.train_labels.sum():.0f} 个72小时序列")
+            print(f"  - 训练集负样本: {(1-self.train_labels).sum():.0f} 个72小时序列")
+            print(f"  - 训练集总计: {len(self.train_sequences)} 个72小时序列")
+            
+        except Exception as e:
+            raise ValueError(f"加载训练数据失败: {e}")
+    
+    def _create_weighted_sampler(self, labels):
+        """创建加权采样器"""
+        class_counts = np.bincount(labels.astype(int))
+        class_weights = 1.0 / class_counts
+        
+        class_weights[1] *= self.config.positive_sample_weight
+        
+        sample_weights = [class_weights[int(label)] for label in labels]
+        
+        return WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+    
+    def train(self) -> None:
+        """训练函数"""
+        if self.train_sequences is None:
+            raise ValueError("请先调用load_train_data()加载数据")
+        
+        if self.val_loader is None:
+            raise ValueError("验证DataLoader未初始化")
+        
+        # 创建训练数据集
+        train_dataset = STIMSequenceDataset(self.train_sequences, self.train_labels)
+        
+        # 创建加权采样器
+        sampler = None
+        if self.config.use_weighted_sampling:
+            sampler = self._create_weighted_sampler(self.train_labels)
+            print("使用加权随机采样")
+        
+        # 创建训练数据加载器
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=self.config.batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=0,
+            pin_memory=True
+        )
+        
+        print(f"\n 开始模型训练...")
+        print(f"  - 模型: SimplifiedSTIMTransformer")
+        print(f"  - 序列长度: {self.config.observation_hours}小时")
+        print(f"  - 特征维度: {self.config.num_features}")
+        print(f"  - 设备: {self.device}")
+        print(f"  - 学习率: {self.config.learning_rate:.2e}")
+        print(f"  - 梯度裁剪: {self.gradient_clip_norm}")
+        print(f"  - 训练批次数: {len(train_loader)} 个批次")
+        print(f"  - 验证批次数: {len(self.val_loader)} 个批次")
+        
+        for epoch in range(self.config.num_epochs):
+            # 训练阶段
+            epoch_losses = []
+            epoch_predictions = []
+            epoch_labels = []
+            epoch_grad_norms = []
+            epoch_logits_stats = []
+            
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
+            
+            for batch_sequences, batch_labels in progress_bar:
+                batch_sequences = batch_sequences.to(self.device)
+                batch_labels = batch_labels.squeeze().to(self.device)
+                
+                # 稳定训练步骤
+                result = self.stable_training_step(batch_sequences, batch_labels)
+                
+                if result[0] is not None:  # 有效的训练步骤
+                    loss, predictions, labels, stats = result
+                    
+                    epoch_losses.append(loss)
+                    epoch_predictions.extend(predictions)
+                    epoch_labels.extend(labels)
+                    epoch_grad_norms.append(stats['grad_norm'])
+                    epoch_logits_stats.append({
+                        'min': stats['min'], 'max': stats['max'],
+                        'mean': stats['mean'], 'std': stats['std']
+                    })
+                    
+                    # 更新进度条
+                    current_lr = self.get_current_lr()
+                    progress_bar.set_postfix({
+                        'Loss': f'{loss:.4f}',
+                        'LR': f'{current_lr:.2e}',
+                        'GradNorm': f'{stats["grad_norm"]:.3f}',
+                        'LogitsRange': f'[{stats["min"]:.2f}, {stats["max"]:.2f}]'
+                    })
+            
+            # 计算训练指标
+            if epoch_losses:
+                train_loss = np.mean(epoch_losses)
+                train_f1 = f1_score(epoch_labels, epoch_predictions, zero_division=0)
+                train_precision = precision_score(epoch_labels, epoch_predictions, zero_division=0)
+                train_recall = recall_score(epoch_labels, epoch_predictions, zero_division=0)
+                
+                avg_grad_norm = np.mean(epoch_grad_norms)
+                logits_min = np.mean([s['min'] for s in epoch_logits_stats])
+                logits_max = np.mean([s['max'] for s in epoch_logits_stats])
+                
+                print(f"\n 训练Epoch {epoch+1}:")
+                print(f"   Loss={train_loss:.4f}, F1={train_f1:.4f}")
+                print(f"   平均梯度norm={avg_grad_norm:.3f}")
+                print(f"   平均logits范围=[{logits_min:.2f}, {logits_max:.2f}]")
+            else:
+                print(f" Epoch {epoch+1}: 没有有效的训练batch")
+                continue
+            
+            # 验证阶段
+            val_loss, val_f1, val_precision, val_recall = self.stable_validation_step()
+            
+            # 学习率调度
+            old_lr = self.get_current_lr()
+            self.scheduler.step(val_loss)
+            new_lr = self.get_current_lr()
+            
+            if old_lr != new_lr:
+                print(f" 学习率调整: {old_lr:.2e} → {new_lr:.2e}")
+            
+            # 记录历史
+            self.train_history['train_loss'].append(train_loss)
+            self.train_history['train_f1'].append(train_f1)
+            self.train_history['train_precision'].append(train_precision)
+            self.train_history['train_recall'].append(train_recall)
+            self.train_history['val_loss'].append(val_loss)
+            self.train_history['val_f1'].append(val_f1)
+            self.train_history['val_precision'].append(val_precision)
+            self.train_history['val_recall'].append(val_recall)
+            self.train_history['learning_rate'].append(new_lr)
+            self.train_history['grad_norm'].append(avg_grad_norm)
+            
+            print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val F1={val_f1:.4f}")
+            
+            # 早停检查
+            if val_f1 > (self.early_stopping.best_score or 0):
+                print(f" 新的最佳验证F1: {val_f1:.4f}")
+            
+            if self.early_stopping(val_f1, self.model):
+                print(f" 早停触发，在第 {epoch+1} 轮停止训练")
+                print(f"   最佳验证F1: {self.early_stopping.best_score:.4f}")
+                break
+        
+        # 加载最佳模型
+        if self.early_stopping.best_model_state is not None:
+            self.model.load_state_dict(self.early_stopping.best_model_state)
+            print(f" 已加载最佳模型 (F1: {self.early_stopping.best_score:.4f})")
+        
+        print(" 模型训练完成!")
+        self._print_training_summary()
+    
+    def _print_training_summary(self):
+        """打印训练总结"""
+        if not self.train_history['train_loss']:
+            return
+            
+        print(f"\n 模型训练总结:")
+        print(f"   最佳验证F1: {max(self.train_history['val_f1']):.4f}")
+        print(f"   最终学习率: {self.train_history['learning_rate'][-1]:.2e}")
+        print(f"   平均梯度norm: {np.mean(self.train_history['grad_norm']):.3f}")
+        print(f"   训练轮数: {len(self.train_history['train_loss'])}")
+        
+        # 检查数值稳定性
+        max_grad_norm = max(self.train_history['grad_norm'])
+        if max_grad_norm < 2.0:
+            print(" 训练数值稳定，梯度范围正常")
+        else:
+            print(f" 最大梯度norm: {max_grad_norm:.3f}，可能存在数值不稳定")
+    
+    def predict_proba(self) -> Dict[str, List]:
+        """预测概率"""
+        if not hasattr(self.model, 'classifier'):
+            raise ValueError("模型尚未训练")
+        
+        self.model.eval()
+        result = {}
+        processed_files = 0
+        
+        test_files = [f for f in os.listdir(self.test_data_path) 
+                      if f.startswith('test_stim_') and f.endswith('.npz')]
+        
+        with torch.no_grad():
+            for file in test_files:
+                try:
+                    test_data = np.load(os.path.join(self.test_data_path, file))
+                    test_sequences = test_data['sequences']
+                    test_timestamps = test_data['timestamps']
+                    test_sn_names = test_data['sn_names']
+                    
+                    processed_files += 1
+                    
+                    test_dataset = STIMSequenceDataset(test_sequences)
+                    test_loader = DataLoader(
+                        test_dataset,
+                        batch_size=self.config.batch_size,
+                        shuffle=False,
+                        num_workers=0
+                    )
+                    
+                    all_probabilities = []
+                    for batch_sequences in test_loader:
+                        batch_sequences = batch_sequences.to(self.device)
+                        logits = self.model(batch_sequences)
+                        probs = torch.sigmoid(logits)
+                        all_probabilities.extend(probs.cpu().numpy())
+                    
+                    # 收集预测结果
+                    for prob, sn, timestamp in zip(all_probabilities, test_sn_names, test_timestamps):
+                        if prob >= 0.5:
+                            result.setdefault(sn, []).append({
+                                'timestamp': int(timestamp),
+                                'datetime': datetime.fromtimestamp(timestamp),
+                                'probability': float(prob)
+                            })
+                
+                except Exception as e:
+                    print(f"处理文件 {file} 时出错: {e}")
+                    continue
+        
+        print(f"处理了 {processed_files} 个测试文件")
+        print(f"收集到 {len(result)} 个SN的预测结果")
+        
+        return result
+    
+    def predict(self, threshold: float = 0.6) -> Dict[str, List]:
+        """使用指定阈值进行预测"""
+        proba_result = self.predict_proba()
+        
+        result = {} 
+        for sn, pred_list in proba_result.items():
+            timestamps = []
+            for pred in pred_list:
+                if pred['probability'] >= threshold:
+                    timestamps.append(pred['timestamp'])
+            
+            if timestamps:
+                result[sn] = timestamps
+        
+        return result
+    
+    def get_model_summary(self):
+        """打印模型摘要"""
+        if self.train_metadata is not None:
+            pos_count = (self.train_labels == 1).sum()
+            neg_count = (self.train_labels == 0).sum()
+            
+            best_f1 = self.early_stopping.best_score if self.early_stopping.best_score else 0.0
+            
+            print(f"模型类型: SimplifiedSTIMTransformer ()")
+            print(f"序列长度: {self.config.observation_hours}小时")
+            print(f"特征维度: {self.config.num_features}")
+            print(f"正样本数: {pos_count}")
+            print(f"负样本数: {neg_count}")
+            print(f"平衡比例: 1:{neg_count/pos_count:.1f}")
+            print(f"最佳验证F1得分: {best_f1:.4f}")
+            print(f"当前学习率: {self.get_current_lr():.2e}")
+            print(f"梯度裁剪阈值: {self.gradient_clip_norm}")
+          
+            if self.val_loader:
+                print(f"验证效率优化: 预创建DataLoader，{len(self.val_loader)}个批次")
+    
+    def plot_training_history(self):
+        """绘制训练历史"""
+        if not self.train_history['train_loss']:
+            print("没有训练历史数据可供绘制")
+            return
+            
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Loss
+        ax1.plot(self.train_history['train_loss'], label='Train Loss', color='blue')
+        ax1.plot(self.train_history['val_loss'], label='Val Loss', color='red')
+        ax1.set_title('Model Loss (Simplified Training)')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True)
+        
+        # F1 Score
+        ax2.plot(self.train_history['train_f1'], label='Train F1', color='green')
+        ax2.plot(self.train_history['val_f1'], label='Val F1', color='orange')
+        ax2.set_title('Model F1 Score (Simplified Training)')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('F1 Score')
+        ax2.legend()
+        ax2.grid(True)
+        
+        # Learning Rate and Gradient Norm
+        ax3_twin = ax3.twinx()
+        line1 = ax3.plot(self.train_history['learning_rate'], label='Learning Rate', color='purple', linewidth=2)
+        line2 = ax3_twin.plot(self.train_history['grad_norm'], label='Grad Norm', color='brown', linewidth=2)
+        
+        ax3.set_title('Learning Rate & Gradient Norm')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Learning Rate', color='purple')
+        ax3_twin.set_ylabel('Gradient Norm', color='brown')
+        ax3.set_yscale('log')
+        
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax3.legend(lines, labels, loc='center right')
+        ax3.grid(True)
+        
+        # Precision and Recall
+        ax4.plot(self.train_history['train_precision'], label='Train Precision', color='cyan')
+        ax4.plot(self.train_history['val_precision'], label='Val Precision', color='magenta')
+        ax4.plot(self.train_history['train_recall'], label='Train Recall', color='yellow')
+        ax4.plot(self.train_history['val_recall'], label='Val Recall', color='gray')
+        ax4.set_title('Precision & Recall (Simplified Training)')
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('Score')
+        ax4.legend()
+        ax4.grid(True)
+        
+        plt.suptitle('模型训练历史 ', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(r'/home/cgh723412/内存预测/效果图表/3optimized_training_history_plan_a.png', dpi=300)
+        plt.close()
+        print("模型训练历史图已保存到 simplified_training_history.png")
+    def evaluate_predictions(self, prediction_dict, eval_true_tickets, eval_start, eval_end, window_days=7):
+
+        """
+        修复的评估函数 - 精确率和召回率都考虑时间窗口
+        """
+        if len(eval_true_tickets) == 0:
+            return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 
+                    'true_count': 0, 'pred_count': len(prediction_dict), 'correct_count': 0}
+
+        true_sn_set = set(eval_true_tickets['sn_name'].unique())
+        window_seconds = window_days * 86400
+
+        # 修复1：统一计算真正例（TP）- 既要SN匹配，又要时间窗口匹配
+        true_positive_count = 0
+        true_positive_sn_set = set()
+
+        # 遍历所有真实故障SN
+        for sn in true_sn_set:
+            if sn in prediction_dict:
+                true_time = eval_true_tickets[eval_true_tickets['sn_name'] == sn]['alarm_time'].values[0]
+
+                # 检查是否有预测在时间窗口内
+                for pred_time in prediction_dict[sn]:
+                    if (true_time - window_seconds) <= pred_time <= true_time:
+                        true_positive_count += 1
+                        true_positive_sn_set.add(sn)
+                        break  # 一个SN只计算一次
+
+        #  修复2：精确率也考虑时间窗口
+        predicted_sn_set = set(prediction_dict.keys())
+
+        # 召回率：在真实故障中，有多少被正确预测（时间窗口内）
+        recall = true_positive_count / len(true_sn_set) if len(true_sn_set) > 0 else 0.0
+
+        # 精确率：在预测中，有多少是真正的故障（时间窗口内）
+        precision = true_positive_count / len(predicted_sn_set) if len(predicted_sn_set) > 0 else 0.0
+
+        # F1得分
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        return {
+            'precision': precision,
+            'recall': recall, 
+            'f1': f1,
+            'true_count': len(true_sn_set),
+            'pred_count': len(predicted_sn_set),
+            'correct_count': true_positive_count,
+            'true_positive_sn_count': len(true_positive_sn_set)  # 新增
+        }
+if __name__ == "__main__":
+    sn_type = "A"
+    test_stage = 1
+    
+    if test_stage == 1:
+        test_data_range: tuple = ("2024-04-01", "2024-05-31")
+    
+    # 修复过拟合的配置
+    #  方案A优化配置
+    config = STIMConfig(
+        feature_path=os.path.join(
+            #此处原文件
+        ),
+        train_data_path=os.path.join(
+            #训练文件
+        ),
+        test_data_path=os.path.join(
+           #测试文件
+        ),
+        test_data_range=test_data_range,
+        ticket_path=r"/home/cgh723412/内存故障预测/failure_ticket.csv",
+
+        use_focal_loss=True,
+        focal_alpha=0.65,     # 适中的alpha值：0.65
+        focal_gamma=1.2,      # 适中的gamma值：1.2
+        # 新增动态α参数
+        use_dynamic_alpha=True,   # 启用动态α
+        min_alpha=0.25,          # α的最小值
+        max_alpha=0.75,          # α的最大值
+        learning_rate=8e-6,   # 提高学习率到3e-6
+        use_weighted_sampling=True,
+        positive_sample_weight=3.0,  # 适中的权重：6.0
+        early_stopping_patience=10,
+    )
+    MODEL_SAVE_PATH = f"/home/cgh723412/内存预测/saved_models/stim_model_type_{sn_type}_optimized.pth"
+    # 训练流程
+    print("=== 生成72小时序列正样本数据 ===")
+    positive_data_generator = STIMPositiveDataGenerator(config)
+    positive_data_generator.generate_and_save_data()
+    
+    print("\n=== 生成72小时序列负样本数据 ===")
+    negative_data_generator = STIMNegativeDataGenerator(config)
+    negative_data_generator.generate_and_save_data()
+    
+    
+    print("\n=== 生成72小时序列测试数据 ===")
+    test_data_generator = STIMTestDataGenerator(config)
+    test_data_generator.generate_and_save_data()
+    
+    print("=== 检查是否存在预训练模型 ===")
+    if os.path.exists(MODEL_SAVE_PATH):
+        # 询问是否加载现有模型
+        load_existing = input(f"发现已保存的模型: {MODEL_SAVE_PATH}\n是否加载现有模型? (y/n): ").lower().strip()
+        
+        if load_existing == 'y' or load_existing == 'yes':
+            print("\n=== 加载预训练模型 ===")
+            try:
+                model = SimplifiedSTIMModel.load_pretrained_model(MODEL_SAVE_PATH, config)
+                print(" 模型加载成功，跳过训练阶段")
+                skip_training = True
+            except Exception as e:
+                print(f" 模型加载失败: {e}")
+                print("将重新训练模型...")
+                skip_training = False
+        else:
+            skip_training = False
+    else:
+        print("未找到预训练模型，将进行训练")
+        skip_training = False
+    
+    if not skip_training:
+        print("\n=== 开始训练新模型 ===")
+        # GPU选择
+        best_device = auto_select_best_gpu_fixed()
+        
+        # 初始化模型
+        model = SimplifiedSTIMModel(config)
+        
+        # 加载训练数据
+        model.load_train_data()
+        
+        # 动态分类器初始化（之前的代码）
+        positive_count = (model.train_labels == 1).sum()
+        total_count = len(model.train_labels)
+        positive_ratio = positive_count / total_count
+        initial_bias = np.log(positive_ratio / (1 - positive_ratio))
+        
+        classifier_final = model.model.classifier[-1]
+        with torch.no_grad():
+            nn.init.normal_(classifier_final.weight, mean=0, std=0.05)
+            nn.init.constant_(classifier_final.bias, initial_bias)
+        
+        print(f"🔧 动态分类器初始化:")
+        print(f"   正样本比例: {positive_ratio:.3f}")
+        print(f"   初始bias: {initial_bias:.3f}")
+        
+        # 训练模型
+        model.get_model_summary()
+        model.train()
+        
+        # 保存训练好的模型
+        print("\n=== 保存训练好的模型 ===")
+        saved_path = model.save_model(MODEL_SAVE_PATH)
+        
+        # 绘制训练历史
+        model.plot_training_history()
+    else:
+        # 🔧 修复：即使跳过训练，也要加载训练数据来获取元数据
+        print("\n=== 加载训练数据以获取统计信息 ===")
+        model.load_train_data()
+        print("  训练数据元数据加载完成")
+    
+    # 从这里开始，无论是加载的模型还是新训练的模型，都进行测试
+    print("\n=== 开始模型测试和评估 ===")
+    
+    # 获取模型信息
+    model_info = model.get_model_info()
+    print(f" 当前模型信息:")
+    print(f"   最佳F1得分: {model_info['best_f1_score']:.4f}")
+    print(f"   训练轮数: {model_info['training_epochs']}")
+    print(f"   当前学习率: {model_info['current_lr']:.2e}")
+    
+    # 继续原来的测试和评估代码...
+    print("\n=== 使用优化的批量预测 ===") 
+    
+    # 定义要测试的阈值
+    test_thresholds = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.91,0.92,0.93,0.94,0.95]
+    
+    #  一次性计算所有阈值的结果（使用缓存）
+    print(" 开始批量预测...")
+    batch_results = model.batch_predict_multiple_thresholds(test_thresholds)
+    
+    #  打印所有阈值的统计结果
+    print("\n 各阈值预测统计:")
+    print("=" * 50)
+    for threshold in test_thresholds:
+        result = batch_results[threshold]
+        total_predictions = sum(len(timestamps) for timestamps in result.values())
+        print(f"阈值 {threshold:3.1f}: {len(result):3d} 个故障SN, {total_predictions:4d} 个预测时间点")
+    print("=" * 50)
+    
+    # 读取真实故障数据进行评估
+    true_tickets = pd.read_csv(config.ticket_path)
+    true_tickets['alarm_time'] = true_tickets['alarm_time']
+    
+    # 评估时间段
+    eval_start_date = "2024-05-01"
+    eval_end_date = "2024-05-31"
+    eval_start = int(datetime.strptime(eval_start_date, "%Y-%m-%d").timestamp())
+    eval_end = int(datetime.strptime(eval_end_date, "%Y-%m-%d").timestamp())
+    
+    # 过滤评估时间段内的真实故障
+    eval_true_tickets = true_tickets[
+        (true_tickets['alarm_time'] >= eval_start) & 
+        (true_tickets['alarm_time'] <= eval_end)
+    ]
+    
+    print(f"\n=== 评估数据验证 ===")
+    print(f"评估时间段: {eval_start_date} ~ {eval_end_date}")
+    print(f"评估时间段内真实故障数量: {len(eval_true_tickets)}")
+    
+
+    if len(eval_true_tickets) > 0:
+
+        print("\n=== 训练样本统计 ===")
+        positive_sn_count = len(set(model.train_metadata['sn_names'][model.train_labels == 1]))
+        negative_sn_count = len(set(model.train_metadata['sn_names'][model.train_labels == 0]))
+        print(f"正样本中的SN数量: {positive_sn_count}")
+        print(f"负样本中的SN数量: {negative_sn_count}")
+
+        print("\n=== 评估数据详细验证 ===")
+        print(f"评估时间段: {eval_start_date} ~ {eval_end_date}")
+        print(f"评估时间段时间戳: [{eval_start}, {eval_end}]")
+        print(f"评估时间段内真实故障数量: {len(eval_true_tickets)}")
+        if not eval_true_tickets.empty:
+            print(f"最早故障时间: {min(eval_true_tickets['alarm_time'])}")
+            print(f"最晚故障时间: {max(eval_true_tickets['alarm_time'])}")
+            print(f"真实故障时间范围: {datetime.fromtimestamp(min(eval_true_tickets['alarm_time']))} ~ {datetime.fromtimestamp(max(eval_true_tickets['alarm_time']))}")
+
+        #  修复的多阈值评估流程
+        print("\n" + "="*100)
+        print(" 修复后的各阈值详细评估结果 (精确率和召回率都考虑时间窗口)")
+        print("="*100)
+        print(f"{'阈值':<6} {'预测SN':<8} {'TP_SN':<8} {'正确预测':<10} {'Precision':<12} {'Recall':<10} {'F1-Score':<10}")
+        print("-"*100)
+
+        all_evaluations = {}
+
+        for threshold in test_thresholds:
+            prediction_dict = batch_results[threshold]
+
+            #  使用修复的评估函数
+            eval_result = model.evaluate_predictions(
+                prediction_dict, eval_true_tickets, eval_start, eval_end, window_days=7
+            )
+
+            all_evaluations[threshold] = eval_result
+
+            # 打印该阈值的评估结果
+            print(f"{threshold:<6.2f} {eval_result['pred_count']:<8d} {eval_result['true_positive_sn_count']:<8d} "
+                  f"{eval_result['correct_count']:<10d} {eval_result['precision']:<12.3f} "
+                  f"{eval_result['recall']:<10.3f} {eval_result['f1']:<10.3f}")
+
+        print("-"*100)
+        print(f"真实故障SN总数: {eval_result['true_count']}")
+        print("="*100)
+
+        #  基于修复后的F1选择最佳阈值
+        best_f1_threshold = max(all_evaluations.keys(), key=lambda x: all_evaluations[x]['f1'])
+        best_precision_threshold = max(all_evaluations.keys(), key=lambda x: all_evaluations[x]['precision'])
+        best_recall_threshold = max(all_evaluations.keys(), key=lambda x: all_evaluations[x]['recall'])
+
+        print(f"\n 修复后的最佳阈值分析:")
+        print(f"最佳F1阈值: {best_f1_threshold} (F1={all_evaluations[best_f1_threshold]['f1']:.3f})")
+        print(f"最佳精确率阈值: {best_precision_threshold} (P={all_evaluations[best_precision_threshold]['precision']:.3f})")
+        print(f"最佳召回率阈值: {best_recall_threshold} (R={all_evaluations[best_recall_threshold]['recall']:.3f})")
+
+        #  使用修复后的最佳F1阈值生成提交文件
+        best_threshold = best_f1_threshold
+        best_result = batch_results[best_threshold]
+
+        print(f"\n 生成修复后的最佳F1阈值提交文件 (阈值 {best_threshold})...")
+        submission = []
+        for sn in best_result:
+            for timestamp in best_result[sn]:
+                submission.append([sn, timestamp, sn_type])
+
+        submission_df = pd.DataFrame(
+            submission, columns=["sn_name", "prediction_timestamp", "serial_number_type"]
+        )
+
+        submission_df.to_csv(
+            "/home/cgh723412/内存预测/效果图表/3submission_fixed_evaluation_stim_72h.csv", 
+            index=False, encoding="utf-8"
+        )
+        print(f" 修复后的最佳F1提交文件已保存 (阈值 {best_threshold}): {len(submission)} 个预测")
+
+
+
+        print(f"预测结果数量: {len(submission_df)}")
+        print(f"预测的唯一SN数量: {submission_df['sn_name'].nunique()}")
+
+        #  详细错误分析（从后面整合过来并修复）
+        print(f"\n=== 详细错误分析 ===")
+
+        # 获取最佳阈值的详细信息
+        best_eval_result = all_evaluations[best_f1_threshold]
+
+        # 重新计算详细的TP/FP/FN分析
+        true_sn_set = set(eval_true_tickets['sn_name'].unique())
+        predicted_sn_dict = submission_df.groupby('sn_name')['prediction_timestamp'].apply(list).to_dict()
+        predicted_sn_set = set(predicted_sn_dict.keys())
+
+        WINDOW_DAYS = 7
+        window_seconds = WINDOW_DAYS * 86400
+
+        # 计算详细的预测结果
+        true_positive_sn_set = set()
+        detailed_results = []
+
+        for sn in true_sn_set:
+            sn_result = {'sn_name': sn, 'predicted': False, 'correct': False, 'true_time': None, 'pred_times': []}
+
+            if sn in eval_true_tickets['sn_name'].values:
+                true_time = eval_true_tickets[eval_true_tickets['sn_name'] == sn]['alarm_time'].values[0]
+                sn_result['true_time'] = true_time
+
+                if sn in predicted_sn_dict:
+                    sn_result['predicted'] = True
+                    sn_result['pred_times'] = predicted_sn_dict[sn]
+
+                    # 检查是否有预测在时间窗口内
+                    for pred_time in predicted_sn_dict[sn]:
+                        if (true_time - window_seconds) <= pred_time <= true_time:
+                            sn_result['correct'] = True
+                            true_positive_sn_set.add(sn)
+                            break
+
+            detailed_results.append(sn_result)
+
+        # 错误分析
+        predicted_but_not_true = predicted_sn_set - true_sn_set
+        true_but_not_predicted = true_sn_set - predicted_sn_set
+        true_and_predicted = predicted_sn_set & true_sn_set
+        # 新增：单独生成误报SN文件
+        false_positive_records = []
+
+        for sn in predicted_but_not_true:
+            if sn in predicted_sn_dict:
+                for pred_time in predicted_sn_dict[sn]:
+                    false_positive_records.append({
+                        'sn_name': sn,
+                        'pretime': pred_time
+                    })
+
+        # 转为DataFrame并保存
+        fp_simple_df = pd.DataFrame(false_positive_records)
+        fp_simple_df.to_csv("/home/cgh723412/内存预测/效果图表/3false_positive_simple.csv", 
+                        index=False, encoding="utf-8")
+# 在原代码的误报文件保存部分之后添加以下代码段
+
+        # 新增：单独生成误报SN文件
+        false_positive_records = []
+
+        for sn in predicted_but_not_true:
+            if sn in predicted_sn_dict:
+                for pred_time in predicted_sn_dict[sn]:
+                    false_positive_records.append({
+                        'sn_name': sn,
+                        'pretime': pred_time
+                    })
+
+        # 转为DataFrame并保存
+        fp_simple_df = pd.DataFrame(false_positive_records)
+        fp_simple_df.to_csv("/home/cgh723412/内存预测/效果图表/3false_positive_simple.csv", 
+                        index=False, encoding="utf-8")
+
+        print(f"\n 误报SN简单文件已保存:")
+        print(f"   文件名: false_positive_simple.csv")
+        print(f"   记录数: {len(false_positive_records)} 条")
+        print(f"   误报SN数: {len(predicted_but_not_true)} 个")
+        print(f"   文件格式: sn_name, pretime")
+
+        # ===== 新增：专门保存阈值0.3的误报文件 =====
+        threshold_03 = 0.7
+        if threshold_03 in batch_results:
+            print(f"\n 正在生成阈值 {threshold_03} 的误报文件...")
+            
+            # 获取阈值0.3的预测结果
+            threshold_03_result = batch_results[threshold_03]
+            
+            # 生成阈值0.3的误报记录
+            false_positive_03_records = []
+            
+            # 预测的SN集合（阈值0.3）
+            predicted_sn_03_set = set(threshold_03_result.keys())
+            
+            # 误报的SN（预测了但不是真实故障的）
+            false_positive_03_sn_set = predicted_sn_03_set - true_sn_set
+            
+            for sn in false_positive_03_sn_set:
+                if sn in threshold_03_result:
+                    for pred_time in threshold_03_result[sn]:
+                        false_positive_03_records.append({
+                            'sn_name': sn,
+                            'pretime': pred_time
+                        })
+            
+            # 保存阈值0.3的误报文件
+            fp_03_df = pd.DataFrame(false_positive_03_records)
+            fp_03_df.to_csv("/home/cgh723412/内存预测/效果图表/3false_positive_threshold_03.csv", 
+                           index=False, encoding="utf-8")
+            
+            print(f"   阈值 {threshold_03} 误报文件已保存:")
+            print(f"   文件名: 3false_positive_threshold_03.csv")
+            print(f"   误报记录数: {len(false_positive_03_records)} 条")
+            print(f"   误报SN数: {len(false_positive_03_sn_set)} 个")
+            print(f"   阈值 {threshold_03} 总预测SN数: {len(predicted_sn_03_set)} 个")
+            print(f"   文件格式: sn_name, pretime")
+            
+            # 对比不同阈值的误报情况
+            print(f"\n 误报对比分析:")
+            print(f"   最佳阈值 {best_f1_threshold}: {len(predicted_but_not_true)} 个误报SN")
+            print(f"   阈值 {threshold_03}: {len(false_positive_03_sn_set)} 个误报SN")
+            print(f"   误报SN增加: {len(false_positive_03_sn_set) - len(predicted_but_not_true)} 个")
+        else:
+            print(f" 警告: 阈值 {threshold_03} 不在测试阈值列表中")
+        print(f"\n 误报SN简单文件已保存:")
+        print(f"   文件名: false_positive_simple.csv")
+        print(f"   记录数: {len(false_positive_records)} 条")
+        print(f"   误报SN数: {len(predicted_but_not_true)} 个")
+        print(f"   文件格式: sn_name, pretime")
+
+        print(f"预测窗口: {WINDOW_DAYS}天")
+        print(f"真实故障SN集合大小: {len(true_sn_set)}")
+        print(f"预测SN集合大小: {len(predicted_sn_set)}")
+        print(f"预测且为真实故障的SN数量: {len(true_and_predicted)}")
+        print(f"时间窗口内正确预测的SN数量: {len(true_positive_sn_set)}")
+        print(f"预测但非真实故障的SN数量 (FP): {len(predicted_but_not_true)}")
+        print(f"真实故障但未预测的SN数量 (FN): {len(true_but_not_predicted)}")
+
+        if len(predicted_but_not_true) > 0:
+            print(f"误报示例 (FP): {list(predicted_but_not_true)[:5]}")
+
+        if len(true_but_not_predicted) > 0:
+            print(f"漏报示例 (FN): {list(true_but_not_predicted)[:5]}")
+
+        if len(true_and_predicted - true_positive_sn_set) > 0:
+            print(f"预测了但时间窗口外的SN: {list(true_and_predicted - true_positive_sn_set)[:5]}")
+
+        #  评估逻辑修复说明
+
+        #  保存详细评估结果（从后面整合过来）
+        detailed_df = pd.DataFrame(detailed_results)
+        detailed_df.to_csv("/home/cgh723412/内存预测/效果图表/3evaluation_details_fixed.csv", 
+                          index=False, encoding="utf-8")
+        print(f"\n详细评估结果已保存到: 4evaluation_details_fixed.csv")
+
+        # 保存完整的评估摘要
+        evaluation_summary = {
+            'model_type': 'SimplifiedSTIMTransformer',
+            'evaluation_period': f"{eval_start_date} ~ {eval_end_date}",
+            'window_days': WINDOW_DAYS,
+            'training_stats': {
+                'positive_sn_count': positive_sn_count,
+                'negative_sn_count': negative_sn_count
+            },
+            'test_stats': {
+                'true_failure_sn_count': len(true_sn_set),
+                'predicted_sn_count': len(predicted_sn_set)
+            },
+            'best_threshold': {
+                'threshold': best_f1_threshold,
+                'precision': best_eval_result['precision'],
+                'recall': best_eval_result['recall'],
+                'f1': best_eval_result['f1'],
+                'true_positive_count': best_eval_result['correct_count'],
+                'true_positive_sn_count': len(true_positive_sn_set)
+            },
+            'error_analysis': {
+                'false_positive_sn_count': len(predicted_but_not_true),
+                'false_negative_sn_count': len(true_but_not_predicted),
+                'predicted_but_wrong_time_count': len(true_and_predicted - true_positive_sn_set)
+            },
+            'all_thresholds': all_evaluations
+        }
+
+        import json
+        with open("/home/cgh723412/内存预测/效果图表/3evaluation_summary_complete.json", "w", encoding="utf-8") as f:
+            json.dump(evaluation_summary, f, ensure_ascii=False, indent=2)
+
+        print(f"\n 最终完整评估结果:")
+        print(f"   最佳阈值: {best_f1_threshold}")
+        print(f"   精确率: {best_eval_result['precision']:.2%}")
+        print(f"   召回率: {best_eval_result['recall']:.2%}")
+        print(f"   F1得分: {best_eval_result['f1']:.2%}")
+        print(f"   真正例: {best_eval_result['correct_count']}")
+        print(f"   假正例: {len(predicted_but_not_true)}")
+        print(f"   假负例: {len(true_but_not_predicted)}")
+
+    else:
+        print("  评估时间段内没有真实故障数据")
+
+
 
