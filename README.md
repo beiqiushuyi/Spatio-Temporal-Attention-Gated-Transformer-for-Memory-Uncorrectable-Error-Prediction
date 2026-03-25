@@ -1,1 +1,2 @@
 # Spatio-Temporal-Attention-Gated-Transformer-for-Memory-Uncorrectable-Error-Prediction
+This project is a deep learning framework based on PyTorch, designed exclusively for server/hardware memory failure prediction. The model analyzes 72 consecutive hours of equipment telemetry data (including 32-dimensional spatial/Bit features and 12-dimensional temporal/Micro features) to predict the probability of equipment failure within a future time window (e.g., 7 days) in advance.
